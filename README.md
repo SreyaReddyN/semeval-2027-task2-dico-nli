@@ -1,0 +1,2 @@
+# semeval-2027-task2-dico-nli
+SemEval 2027 Task 2: Directional-Consistent Fine-Grained Natural Language Inference (DiCo-NLI)
