@@ -1,4 +1,4 @@
-"""DiCo-NLI DeBERTa-v3-base: standard baseline and reversal-aware training.
+"""DiCo-NLI DeBERTa-v3-large: standard baseline and reversal-aware training.
 
 Run `python train_dico_nli.py --help` for options. No training occurs on import.
 """
@@ -46,6 +46,8 @@ def load_data(path, name):
 def validate_pairs(df, name):
     issues = []
     for pid, group in df.groupby('pair_id'):
+        if len(group) == 1 and int(group.iloc[0].labels) == LABEL2ID['NEGATIVE_OTHER']:
+            continue  # Official data contains one direction for these examples.
         if len(group) != 2:
             issues.append(f'{pid}: expected 2 rows, found {len(group)}')
             continue
@@ -112,7 +114,8 @@ def evaluate(model, loader, device):
     with torch.inference_mode():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            result = model(**batch)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                result = model(**batch)
             losses += result.loss.item() * len(batch['labels'])
             labels.extend(batch['labels'].cpu().tolist())
             predictions.extend(result.logits.argmax(-1).cpu().tolist())
@@ -127,7 +130,7 @@ def reversal_loss(model, batch, device, weight):
     logits_a, logits_b = model(**a).logits, model(**b).logits
     cls = (F.cross_entropy(logits_a, batch['labels_original'].to(device)) +
            F.cross_entropy(logits_b, batch['labels_reversed'].to(device))) / 2
-    cons = F.mse_loss(F.softmax(logits_a, -1), F.softmax(logits_b, -1)[:, REVERSE])
+    cons = F.mse_loss(F.softmax(logits_a.float(), -1), F.softmax(logits_b.float(), -1)[:, REVERSE])
     return cls + weight * cons, cls, cons
 
 
@@ -143,7 +146,12 @@ def train(args, mode, train_df, dev_df, tokenizer, device):
         dataset = ReversalDataset(train_df, tokenizer, args.max_length)
         train_loader = DataLoader(dataset, batch_size=args.reverse_batch_size, shuffle=True, collate_fn=reversal_collator(tokenizer))
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=4, id2label=ID2LABEL, label2id=LABEL2ID).to(device)
+    if device.type == "cuda":
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
+    use_amp = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     best_f1, best_epoch, patience, history = -float('inf'), 0, 0, []
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -151,18 +159,23 @@ def train(args, mode, train_df, dev_df, tokenizer, device):
         count = 0
         for batch in tqdm(train_loader, desc=f'{mode} epoch {epoch}/{args.epochs}'):
             optimizer.zero_grad(set_to_none=True)
-            if mode == 'baseline':
-                batch = {k: v.to(device) for k, v in batch.items()}
-                loss = model(**batch).loss
-                cls, cons = loss, torch.zeros_like(loss)
-                n = len(batch['labels'])
-            else:
-                loss, cls, cons = reversal_loss(model, batch, device, args.consistency_weight)
-                n = len(batch['labels_original'])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
-            optimizer.step()
-            totals += np.array([loss.item(), cls.item(), cons.item()]) * n
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                if mode == 'baseline':
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    loss = model(**batch).loss
+                    cls, cons = loss, torch.zeros_like(loss)
+                    n = len(batch['labels'])
+                else:
+                    loss, cls, cons = reversal_loss(model, batch, device, args.consistency_weight)
+                    n = len(batch['labels_original'])
+            if not torch.isfinite(loss):
+                raise RuntimeError(f'Non-finite training loss at epoch {epoch}; stop and inspect numerical stability')
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            totals += np.array([loss.detach().item(), cls.detach().item(), cons.detach().item()]) * n
             count += n
         metrics = evaluate(model, dev_loader, device)
         row = {'epoch': epoch, 'train_total_loss': totals[0]/count,
@@ -180,7 +193,9 @@ def train(args, mode, train_df, dev_df, tokenizer, device):
                 print(f'Early stopping at epoch {epoch}')
                 break
     pd.DataFrame(history).to_csv(out / 'training_history.csv', index=False)
-    del model, optimizer
+    del model, optimizer, scaler
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     if device.type == 'mps':
         torch.mps.empty_cache()
     best_model = AutoModelForSequenceClassification.from_pretrained(out / 'best_model').to(device)
@@ -189,7 +204,9 @@ def train(args, mode, train_df, dev_df, tokenizer, device):
     with torch.inference_mode():
         for batch in tqdm(dev_loader, desc=f'{mode} predictions'):
             batch = {k: v.to(device) for k, v in batch.items()}
-            probabilities = best_model(**batch).logits.softmax(-1).cpu()
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                logits = best_model(**batch).logits
+            probabilities = logits.float().softmax(-1).cpu()
             preds.extend(probabilities.argmax(-1).tolist())
             confidences.extend(probabilities.max(-1).values.tolist())
     prediction_df = dev_df[['instance_id', 'pair_id', 'label']].copy()
@@ -216,9 +233,9 @@ def main():
     parser.add_argument('--mode', choices=['validate', 'baseline', 'reversal', 'both'], default='validate')
     parser.add_argument('--device', choices=['auto', 'cpu', 'mps', 'cuda'], default='auto')
     parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--reverse-batch-size', type=int, default=4)
-    parser.add_argument('--eval-batch-size', type=int, default=16)
+    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--reverse-batch-size', type=int, default=1)
+    parser.add_argument('--eval-batch-size', type=int, default=1)
     parser.add_argument('--max-length', type=int, default=128)
     parser.add_argument('--learning-rate', type=float, default=2e-5)
     parser.add_argument('--consistency-weight', type=float, default=0.5)
@@ -235,7 +252,7 @@ def main():
         print('Validation finished; no model downloaded or trained.')
         return
     if train_issues or dev_issues:
-        print('WARNING: some pairs are missing/inconsistent; reversal training may fail if inconsistent pairs exist.')
+        raise ValueError('Invalid directional pairs detected; fix the data before training')
     if args.device == 'auto':
         device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     else:
