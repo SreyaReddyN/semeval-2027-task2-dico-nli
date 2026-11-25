@@ -1,0 +1,9 @@
+torch>=2.3,<3
+transformers>=4.44,<5
+sentencepiece>=0.2
+protobuf>=4
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+tqdm>=4.66
+safetensors>=0.4
