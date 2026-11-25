@@ -147,8 +147,12 @@ def train(args, mode, train_df, dev_df, tokenizer, device):
         train_loader = DataLoader(dataset, batch_size=args.reverse_batch_size, shuffle=True, collate_fn=reversal_collator(tokenizer))
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=4, id2label=ID2LABEL, label2id=LABEL2ID).to(device)
     if device.type == "cuda":
-        model.gradient_checkpointing_enable()
-        print("Gradient checkpointing enabled")
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": False
+            }
+        )
+        print("Non-reentrant gradient checkpointing enabled")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
     use_amp = device.type == 'cuda'
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
